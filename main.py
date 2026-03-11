@@ -640,7 +640,7 @@ def heartbeat_playwright(site_name: str, url: str, screenshot: bool = False) -> 
             with sync_playwright() as p:
                 logger.info("[%s] Launching Playwright Chromium...", site_name)
                 # Build launch kwargs in a portable way (don't hardcode executable_path)
-                launch_kwargs = {"headless": False, "args": ["--disable-gpu", "--no-sandbox"]}
+                launch_kwargs = {"headless": True, "args": ["--disable-gpu", "--no-sandbox"]}
                 try:
                     if Path("/usr/bin/chromium").exists():
                         launch_kwargs["executable_path"] = "/usr/bin/chromium"
@@ -1044,3 +1044,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
