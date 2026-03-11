@@ -602,10 +602,23 @@ def heartbeat_public(site_name: str, public_url: str, timeout: int = 10) -> bool
         resp = requests.get(public_url, timeout=timeout, allow_redirects=True)
         final_url = resp.url
 
-        # Treat redirects to common login pages as failures
+        # Treat redirects to common login pages as failures, but only when the
+        # final URL's domain differs from the public_url domain (i.e., a redirect
+        # to an auth host). Some apps legitimately use /login paths on the same
+        # domain while still keeping sessions alive.
+        from urllib.parse import urlparse
+
+        try:
+            parsed_public = urlparse(public_url).hostname or ""
+            parsed_final = urlparse(final_url).hostname or ""
+        except Exception:
+            parsed_public = ""
+            parsed_final = ""
+
         login_indicators = ["login", "signin", "accounts.google.com"]
-        if any(ind in final_url.lower() for ind in login_indicators):
-            logger.warning("[%s] ⚠ Public URL appears redirected to login: %s", site_name, final_url)
+        is_login_path = any(ind in final_url.lower() for ind in login_indicators)
+        if is_login_path and parsed_public != parsed_final:
+            logger.warning("[%s] ⚠ Public URL appears redirected to login at different host: %s", site_name, final_url)
             return False
 
         if resp.status_code == 200:
@@ -692,11 +705,22 @@ def heartbeat_playwright(site_name: str, url: str, screenshot: bool = False) -> 
                 current_url = page.url
                 title = page.title() or "(no title)"
 
-                # Check for login redirect
+                # Check for login redirect — consider it a failure only if the final
+                # URL's domain differs from the configured admin URL domain.
+                from urllib.parse import urlparse
+
+                try:
+                    parsed_admin = urlparse(url).hostname or ""
+                    parsed_current = urlparse(current_url).hostname or ""
+                except Exception:
+                    parsed_admin = ""
+                    parsed_current = ""
+
                 login_indicators = ["login", "signin", "accounts.google.com"]
-                if any(ind in current_url.lower() for ind in login_indicators):
+                is_login_path = any(ind in current_url.lower() for ind in login_indicators)
+                if is_login_path and parsed_admin != parsed_current:
                     logger.warning(
-                        "[%s] ⚠ Session expired — landed on login page: %s", site_name, current_url
+                        "[%s] ⚠ Session expired — landed on login page at different host: %s", site_name, current_url
                     )
                     if screenshot:
                         _save_screenshot_pw(page, site_name, "expired")
@@ -811,6 +835,38 @@ def run_site(site_name: str, once: bool = False, screenshot: bool = False) -> No
     if site_name not in sites:
         logger.error("Site '%s' not found in configuration; aborting runner.", site_name)
         return
+
+    # Wait until this site becomes "ready" (has cookies or public_url) before proceeding
+    while not _shutdown.is_set():
+        try:
+            sites = config.load_sites()
+            config.SITES = sites
+        except Exception:
+            if _shutdown.wait(timeout=2):
+                return
+            continue
+
+        if site_name not in sites:
+            logger.info("[%s] Not present in configuration yet; waiting...", site_name)
+            if _shutdown.wait(timeout=2):
+                return
+            continue
+
+        cfg_tmp = sites.get(site_name, {})
+        cookie_identifier = None
+        try:
+            cookie_identifier = cfg_tmp.get("cookie_file") if isinstance(cfg_tmp, dict) else None
+        except Exception:
+            cookie_identifier = None
+        target = cookie_identifier or site_name
+        if cookies_path(target).exists() or "public_url" in (cfg_tmp or {}):
+            # Site is ready
+            break
+
+        logger.info("[%s] Waiting for cookies or public_url to be available...", site_name)
+        if _shutdown.wait(timeout=5):
+            return
+
     cfg = sites[site_name]
 
     # Track last full Playwright run — start now so first full run occurs after `interval`
@@ -905,7 +961,9 @@ def run_site(site_name: str, once: bool = False, screenshot: bool = False) -> No
         if consecutive_failures > 0:
             backoff = min(60 * (2 ** (consecutive_failures - 1)), max_backoff)
             sleep = backoff
-            logger.info("[%s] Retry in %s (failure #%d).", site_name, format_duration(backoff), consecutive_failures)
+            logger.info(
+                "[%s] Retry in %s (failure #%d).", site_name, format_duration(backoff), consecutive_failures
+            )
         else:
             sleep = ping_interval if "public_url" in cfg else interval
 
@@ -968,66 +1026,13 @@ def main() -> None:
     else:
         target_sites = list(config.SITES.keys())
 
-    # Helper to determine if a site is "ready" (has cookies or a public_url)
-    def _site_is_ready(name: str) -> bool:
-        cfg = config.SITES.get(name, {})
-        cookie_identifier = None
-        try:
-            cookie_identifier = cfg.get("cookie_file") if isinstance(cfg, dict) else None
-        except Exception:
-            cookie_identifier = None
-        target = cookie_identifier or name
-        return cookies_path(target).exists() or "public_url" in (cfg or {})
+    # Start a runner thread for every configured target site. Each runner will
+    # wait until its site is "ready" (has cookies or public_url) before doing work.
+    logger.info("Starting keep-alive threads for %d configured site(s).", len(target_sites))
+    logger.debug("Configured sites: %s", ", ".join(target_sites))
 
-    # Filter to sites that actually have cookies (or provide a public_url)
-    ready_sites = []
-    for name in target_sites:
-        if _site_is_ready(name):
-            ready_sites.append(name)
-        else:
-            logger.warning("Skipping '%s' — no cookies found.", name)
-
-    # If nothing ready, and dashboard is available, wait for sites to be added via the dashboard
-    if not ready_sites:
-        if dashboard_app is None:
-            logger.error("No sites ready. Collect cookies first!")
-            sys.exit(1)
-        else:
-            logger.info("No sites ready. Waiting for sites to be added via dashboard...")
-            # Poll for new sites until shutdown or sites become ready
-            while not _shutdown.is_set():
-                try:
-                    config.SITES = config.load_sites()
-                except Exception:
-                    time.sleep(1)
-                    continue
-                target_sites = list(config.SITES.keys())
-                ready_sites = [n for n in target_sites if _site_is_ready(n)]
-                if ready_sites:
-                    logger.info("Detected %d site(s) ready; starting...", len(ready_sites))
-                    break
-                # Wait a short time before re-checking; allow graceful shutdown while waiting
-                if _shutdown.wait(timeout=5):
-                    break
-            if not ready_sites:
-                logger.info("Shutdown received before sites were added. Exiting.")
-                sys.exit(0)
-
-    logger.info("=" * 60)
-    logger.info("  Keep-Alive (Playwright Version) — %d site(s)", len(ready_sites))
-    for name in ready_sites:
-        mode = config.SITES[name].get("mode", "requests")
-        if mode == "selenium":
-            mode = "playwright"
-        interval = format_duration(config.SITES[name]["refresh_interval"])
-        logger.info("    • %s [%s] every %s", name, mode.upper(), interval)
-    if once:
-        logger.info("  Mode: single pass")
-    logger.info("=" * 60)
-
-    # Run sites concurrently in threads
     threads = []
-    for name in ready_sites:
+    for name in target_sites:
         if _shutdown.is_set():
             logger.info("Shutdown signal received, skipping remaining sites.")
             break
@@ -1041,7 +1046,12 @@ def main() -> None:
 
     logger.info("Keep-Alive stopped. Goodbye!")
 
+    # Wait for all threads to finish. The signal handler will trigger termination.
+    for t in threads:
+        t.join()
+
+    logger.info("Keep-Alive stopped. Goodbye!")
+
 
 if __name__ == "__main__":
     main()
-
